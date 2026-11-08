@@ -10,6 +10,9 @@
 - `get_console` drops duplicate entries (same time, type and message) that Moonraker can store several times.
 - The capture systemd unit is sandboxed (ProtectSystem=strict, ProtectHome=read-only with the store directory writable, NoNewPrivileges, empty capability set, `@system-service` syscall filter).
 ### Added
+- get_loaded_filaments (tracker #68): each U1 head's filament as set in HelixScreen (Moonraker `lane_data` database: brand, spool name, material, colour, Spoolman spool, grams, temps) beside the printer's own record (`print_task_config`) and the feeder sensor; `stale_heads` lists where they disagree.
+- sync_firmware_filaments(heads?, confirm): rewrites the printer's record from HelixScreen the way HelixScreen does (`SET_PRINT_FILAMENT_CONFIG`, vendor Snapmaker/Generic, sub-type or Basic, colour). Refused during a print; skips RFID-tag heads.
+- check_runout_backups / start_print preview name heads by their HelixScreen filament and warn when the printer's record (what refill matches on) disagrees.
 - get_camera_snapshot: a still from the printer camera as an image (cameras from Moonraker's webcam list, pick one by name; falls back to the usual /webcam snapshot paths). Read-only.
 - Read tools: get_printer_status, get_printer_info, list_print_history, list_gcode_files.
 - Read tools: get_console (recent console lines, temp reports filtered, optional regex), get_power_devices, get_bed_mesh (grid plus range, tilt and corner summary).
