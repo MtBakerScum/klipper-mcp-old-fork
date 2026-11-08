@@ -100,13 +100,28 @@ def _cfg_path_ok(path: str) -> str | None:
     return p
 
 
+_READABLE = (".cfg", ".conf", ".json", ".env", ".txt", ".ini", ".yaml", ".yml", ".toml", ".md", ".log", ".sh", ".py")
+
+
+def _readable_path_ok(path: str) -> str | None:
+    p = (path or "").replace("\\", "/").lstrip("/")
+    if not p or ".." in p.split("/") or not p.lower().endswith(_READABLE):
+        return None
+    return p
+
+
 @mcp.tool()
-async def list_config_files() -> dict:
+async def list_config_files(all_files: bool = False) -> dict:
     """List the printer's config files (Moonraker's "config" root: printer.cfg, moonraker.conf and,
-    on the U1's extended firmware, extended/klipper/*.cfg). Read-only."""
+    on the U1's extended firmware, extended/klipper/*.cfg). all_files=true lists every file and
+    folder there (e.g. helixscreen/ with HelixScreen's own settings and user_filaments.json),
+    with sizes. Read-only."""
     try:
         async with _client() as c:
             files = await c.config_files()
+        if all_files:
+            return {"files": sorted(({"path": f.get("path"), "size": f.get("size")} for f in files),
+                                    key=lambda f: str(f["path"]))}
         return {"files": sorted(f.get("path") for f in files
                                 if str(f.get("path", "")).lower().endswith((".cfg", ".conf")))}
     except ApiError as e:
@@ -115,11 +130,12 @@ async def list_config_files() -> dict:
 
 @mcp.tool()
 async def read_config_file(path: str) -> dict:
-    """Read one config file by its path from list_config_files (e.g. "extended/klipper/exhaust.cfg").
-    Read-only."""
-    p = _cfg_path_ok(path)
+    """Read one file under the config root by its path from list_config_files (e.g.
+    "extended/klipper/exhaust.cfg", "helixscreen/user_filaments.json"): .cfg/.conf and other text
+    files (.json, .env, .txt, .ini, .yaml, .toml, .md, .log, .sh, .py). Read-only."""
+    p = _readable_path_ok(path)
     if p is None:
-        return {"error": "bad_path", "hint": "a .cfg/.conf path from list_config_files, no '..'"}
+        return {"error": "bad_path", "hint": "a text file path from list_config_files(all_files=true), no '..'"}
     try:
         async with _client() as c:
             text = await c.config_read(p)
