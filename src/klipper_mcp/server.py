@@ -701,11 +701,14 @@ async def list_spools(status: str | None = None, material: str | None = None, in
 @mcp.tool()
 async def save_spool(spool_id: str, brand: str | None = None, material: str | None = None,
                      colour: str | None = None, preset: str | None = None, start_g: float | None = None,
-                     status: str | None = None, notes: str | None = None, location: str | None = None) -> dict:
+                     status: str | None = None, notes: str | None = None, location: str | None = None,
+                     name: str | None = None) -> dict:
     """Add a spool or change its fields (only the ones given). spool_id: e.g. "BLK-PLA-02"
     (letters, digits, - and _). start_g: net filament grams when tracking starts (nominal 1000
     for a new 1 kg spool); a new spool's tracking starts now. status: Active / Sealed / Empty.
-    location: where it is when not on a head (shelf, dryer...). Use weigh_spool for weigh-ins
+    location: where it is when not on a head (shelf, dryer...). name: the spool's own name as
+    HelixScreen shows it ("Marble", "90A"); Snorca's Spools tab sends it to HelixScreen when the
+    spool goes on a head, and Snorca's Sync matches presets by brand + name. Use weigh_spool for weigh-ins
     and load_spool for heads."""
     if not spools.valid_id(spool_id):
         return {"error": "spool_id: 1-40 letters, digits, - or _"}
@@ -714,7 +717,8 @@ async def save_spool(spool_id: str, brand: str | None = None, material: str | No
             cur = (await c.database_namespace(spools.NS_SPOOLS) or {}).get(spool_id)
             sp = dict(cur or {})
             for k, v in {"brand": brand, "material": material, "colour": colour, "preset": preset,
-                         "start_g": start_g, "status": status, "notes": notes, "location": location}.items():
+                         "start_g": start_g, "status": status, "notes": notes, "location": location,
+                         "name": name}.items():
                 if v is not None:
                     sp[k] = v
             if cur is None:

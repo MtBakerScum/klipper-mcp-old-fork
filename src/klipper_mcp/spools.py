@@ -30,7 +30,7 @@ HEADS = 4
 ON_HEAD = ("loaded", "backup")
 OFF_HEAD = ("unloaded", "ran out", "removed", "empty")
 FINISHED = ("completed", "cancelled", "error", "klippy_shutdown", "klippy_disconnect", "interrupted")
-SPOOL_FIELDS = ("brand", "material", "colour", "preset", "start_g", "tracked_from", "status", "notes",
+SPOOL_FIELDS = ("brand", "material", "name", "colour", "preset", "start_g", "tracked_from", "status", "notes",
                 "weighed_g", "weighed_at", "location")
 _ID = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
 
