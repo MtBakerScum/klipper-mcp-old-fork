@@ -809,6 +809,8 @@ async def import_spools(path: str, confirm: bool = False) -> dict:
                 return {"error": "inventory_not_empty", "reason": "the printer already has spools; nothing imported"}
             summary = {"spools": len(data["spools"]), "usage_rows": len(data["usage"]), "load_rows": len(data["loads"]),
                        "ids": sorted(data["spools"])}
+            if data.get("renamed"):
+                summary["renamed_ids"] = data["renamed"]  # sheet ID -> database ID (brackets, spaces...)
             if not confirm:
                 return gate.confirm_required("import_spools", summary)
             for ns, rows in ((spools.NS_SPOOLS, data["spools"]), (spools.NS_USAGE, data["usage"]),

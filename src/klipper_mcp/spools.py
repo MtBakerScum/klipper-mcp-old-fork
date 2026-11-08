@@ -200,9 +200,25 @@ def import_workbook(path: str) -> dict:
                 yield dict(zip(hdr, r))
 
     spools, usage, loads = {}, {}, {}
+    renamed: dict[str, str] = {}
+
+    def fix_id(raw) -> str | None:
+        """The sheet's spool ID as a database key: "(Polymaker ASA Black)" -> "Polymaker-ASA-Black"."""
+        sid = str(raw or "").strip()
+        if not sid or sid in ("—", "-"):
+            return None
+        if sid in renamed:
+            return renamed[sid]
+        if valid_id(sid):
+            return sid
+        new = re.sub(r"[^A-Za-z0-9_\-]+", "-", sid).strip("-")[:40] or None
+        if new:
+            renamed[sid] = new
+        return new
+
     for r in rows("Spools"):
-        sid = str(r.get("Spool ID") or "").strip()
-        if not valid_id(sid):
+        sid = fix_id(r.get("Spool ID"))
+        if not sid:
             continue
         loc = str(r.get("Current head") or "").strip()
         sp = {"brand": r.get("Brand"), "material": r.get("Material"), "colour": r.get("Colour"),
@@ -215,15 +231,22 @@ def import_workbook(path: str) -> dict:
         if w not in (None, ""):
             sp["notes"] = f"{sp.get('notes') or ''} Weighed: {w}".strip()
         spools[sid] = {k: v for k, v in sp.items() if v not in (None, "")}
-    for r in rows("Usage log"):
+    for n_row, r in enumerate(rows("Usage log"), start=2):
         jid = str(r.get("Job ID") or "").strip()
+        if jid in ("—", "-"):
+            jid = ""
         head = r.get("Head")
-        if not jid or head in (None, ""):
-            continue
-        key = f"{jid}_h{int(head)}"
+        try:
+            h = int(head)
+        except (TypeError, ValueError):
+            h = 0
+        # Rows with no job ID (hand entries) are keyed by their sheet row, so none overwrites another.
+        key = f"{jid}_h{h}" if jid else f"sheet{n_row}_h{h}"
+        if key in usage:
+            key = f"{key}_r{n_row}"
         usage[key] = {k: v for k, v in {
-            "time": _d(r.get("Date")), "job_id": jid, "gcode": r.get("G-code"), "result": r.get("Result"),
-            "head": int(head), "spool_id": r.get("Spool ID"), "grams": _num(r.get("Grams")) or 0.0,
+            "time": _d(r.get("Date")), "job_id": jid or None, "gcode": r.get("G-code"), "result": r.get("Result"),
+            "head": h or None, "spool_id": fix_id(r.get("Spool ID")), "grams": _num(r.get("Grams")) or 0.0,
             "source": r.get("Source"), "notes": r.get("Notes")}.items() if v not in (None, "")}
     n = 0
     for r in rows("Loads"):
@@ -234,10 +257,10 @@ def import_workbook(path: str) -> dict:
         except (TypeError, ValueError):
             h = None
         loads[load_key(t, h, n)] = {k: v for k, v in {
-            "time": t, "head": h, "spool_id": r.get("Spool ID"), "action": str(r.get("Action") or "").lower(),
+            "time": t, "head": h, "spool_id": fix_id(r.get("Spool ID")), "action": str(r.get("Action") or "").lower(),
             "notes": r.get("Notes")}.items() if v not in (None, "")}
         n += 1
-    return {"spools": spools, "usage": usage, "loads": loads}
+    return {"spools": spools, "usage": usage, "loads": loads, "renamed": renamed}
 
 
 def export_workbook(path: str, spools: dict, usage: dict, loads: dict) -> None:

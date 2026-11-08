@@ -112,3 +112,31 @@ async def test_import_gated_then_refused_when_full(monkeypatch, tmp_path):
     assert (await srv.import_spools(str(src), confirm=True))["error"] == "inventory_not_empty"
     lst = await srv.list_spools(include_empty=True)
     assert len(lst["spools"]) >= 10 and lst["stock"]
+
+
+def test_import_keeps_bracketed_ids_and_rows_without_job_id(tmp_path):
+    import openpyxl
+    from klipper_mcp import spools as sp
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Spools"
+    ws.append(["Spool ID", "Brand", "Material", "Start g (at tracking start)"])
+    ws.append(["(Polymaker ASA Black)", "Polymaker", "ASA", 1000])
+    ws.append(["BLK-TPU-01", "Overture", "TPU", 1000])
+    u = wb.create_sheet("Usage log")
+    u.append(["Date", "Job ID", "G-code", "Result", "Head", "Spool ID", "Grams", "Source", "Notes"])
+    u.append(["2026-10-01", "—", "a", "completed", 2, "BLK-TPU-01", 59.77, "hand", None])
+    u.append(["2026-10-02", "—", "b", "completed", 2, "BLK-TPU-01", 10.0, "hand", None])
+    u.append(["2026-10-03", "0000A1", "c", "completed", 3, "(Polymaker ASA Black)", 5.0, "slicer", None])
+    ld = wb.create_sheet("Loads")
+    ld.append(["Date", "Head", "Spool ID", "Action", "Notes"])
+    ld.append(["2026-10-01", 3, "(Polymaker ASA Black)", "loaded", None])
+    f = tmp_path / "t.xlsx"
+    wb.save(f)
+    d = sp.import_workbook(str(f))
+    assert "Polymaker-ASA-Black" in d["spools"]
+    assert d["renamed"] == {"(Polymaker ASA Black)": "Polymaker-ASA-Black"}
+    rows = {r["id"]: r for r in sp.view(d["spools"], d["usage"], d["loads"])}
+    assert rows["BLK-TPU-01"]["used_g"] == 69.8
+    assert rows["Polymaker-ASA-Black"]["used_g"] == 5.0
+    assert rows["Polymaker-ASA-Black"]["head"] == 3
