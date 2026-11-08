@@ -97,6 +97,16 @@ class MoonrakerClient:
         res = await self._request("GET", f"/printer/objects/query?{params}")
         return (res or {}).get("status", {})
 
+    async def database_namespace(self, namespace: str) -> dict | None:
+        """All keys of a Moonraker database namespace, or None if it doesn't exist."""
+        from .errors import NotFound
+        try:
+            r = await self._request("GET", "/server/database/item", params={"namespace": namespace})
+        except NotFound:
+            return None
+        v = (r or {}).get("value") if isinstance(r, dict) else None
+        return v if isinstance(v, dict) else None
+
     async def history_list(self, limit: int = 20, since: float | None = None) -> list[dict]:
         params = {"limit": limit, "order": "desc"}
         if since is not None:

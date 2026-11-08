@@ -11,6 +11,7 @@ from . import gate
 from . import outcomes
 from . import runout
 from . import offsets
+from . import helix
 from .status import summarize_status, STATUS_OBJECTS
 
 try:
@@ -521,6 +522,26 @@ async def _runout_state(c, filename: str | None = None, tools: list[int] | None 
             tools = [int(t) for t in rt if isinstance(t, (int, float))]
     heads = runout.used_heads(ptc, tools)
     rep = runout.report(ptc, feeds, sensors, extruders, heads)
+    # Tracker #68: name heads by what HelixScreen has set, and say when the printer's own record
+    # (which the refill actually matches on) disagrees with it.
+    try:
+        hx = helix.summarize(ptc, await c.database_namespace(helix.NAMESPACE))
+        by_head = {r["head"]: r for r in hx["heads"]}
+        for row in rep["heads"]:
+            hr = by_head.get(row["head"]) or {}
+            if hr.get("helix"):
+                row["helix_filament"] = hr["filament"]
+            if hr.get("firmware_stale"):
+                row["firmware_stale"] = hr["firmware_stale"]
+        used = {r["head"] for r in rep["heads"]}
+        stale = [h for h in hx["stale_heads"] if h in used]
+        if stale:
+            rep["warnings"].append(
+                f"the printer's filament record for head(s) {', '.join(map(str, stale))} doesn't match "
+                f"HelixScreen; the runout refill matches on the printer's record, so backups above may be "
+                f"wrong. sync_firmware_filaments() fixes it (not during a print)")
+    except Exception:  # best effort: Helix may not be installed
+        pass
     rep["used_heads_from"] = "file" if tools else "printer"
     rep["empty_used_heads"] = [h["head"] for h in rep["heads"] if not h["loaded"]]
     return {"supported": True, **rep}
@@ -541,6 +562,92 @@ async def check_runout_backups(path: str | None = None) -> dict:
                 return await _runout_state(c, None, _local_gcode_tools(Path(path)))
             return await _runout_state(c, path or None)
     except ApiError as e:
+        return _err(e)
+
+
+_FEED_OBJS = ("filament_feed left", "filament_feed right")
+
+
+async def _filament_state(c) -> dict:
+    names = await c.objects_list()
+    if "print_task_config" not in names:
+        return {"supported": False}
+    want = ["print_task_config", "print_stats"] + [n for n in names if n.startswith("filament_feed")]
+    q = await c.objects_query_named(want)
+    feeds: dict = {}
+    for n, v in q.items():
+        if n.startswith("filament_feed"):
+            feeds.update(v or {})
+    detected = {i: bool((feeds.get(f"extruder{i}") or {}).get("filament_detected")) for i in range(helix.HEADS)}
+    out = helix.summarize(q.get("print_task_config") or {}, await c.database_namespace(helix.NAMESPACE), detected)
+    out["supported"] = True
+    out["job_state"] = (q.get("print_stats") or {}).get("state")
+    return out
+
+
+@mcp.tool()
+async def get_loaded_filaments() -> dict:
+    """Snapmaker U1: the filament on each head as set in HelixScreen (brand, spool name, material,
+    colour, Spoolman spool, remaining grams, temps; Moonraker's lane_data database), next to the
+    printer's own record of it (print_task_config: vendor Snapmaker/Generic, type, sub-type,
+    colour; what runout refill, RESUME and the stock screen use) and whether the feeder sees
+    filament. Heads where the two disagree are listed in stale_heads; HelixScreen holds its write
+    to the printer during a print, so it can lag. Use this, not print_task_config, to say what is
+    loaded. Read-only."""
+    try:
+        async with _client() as c:
+            return await _filament_state(c)
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def sync_firmware_filaments(heads: list[int] | None = None, confirm: bool = False) -> dict:
+    """Snapmaker U1: rewrite the printer's filament record (print_task_config) for heads where it
+    disagrees with HelixScreen, the same way HelixScreen does (SET_PRINT_FILAMENT_CONFIG: vendor
+    Snapmaker or Generic, type, sub-type or Basic, colour). Fixes runout refill matching and
+    RESUME after Helix's write didn't land. heads: 1-4 (default: every stale head). Refused while a
+    print is running or paused (the firmware refuses it mid-print, and each write resets that
+    head's flow K). Skips heads whose record came from an RFID tag. TWO-PHASE: without
+    confirm=true this returns a preview and changes nothing."""
+    try:
+        async with _client() as c:
+            await _ready_and_status(c)
+            st = await _filament_state(c)
+            if not st.get("supported"):
+                return {"supported": False}
+            if st.get("job_state") in ("printing", "paused"):
+                return {"error": "print_running", "reason": "the printer refuses filament record changes during a "
+                        "print; run this when it is idle"}
+            want = set(heads) if heads else set(st["stale_heads"])
+            if any(not isinstance(h, int) or not 1 <= h <= helix.HEADS for h in want):
+                return {"error": f"heads are 1-{helix.HEADS}"}
+            lines, skipped = [], []
+            for row in st["heads"]:
+                h = row["head"]
+                if h not in want:
+                    continue
+                if not row.get("helix") or not row["helix"].get("material"):
+                    skipped.append({"head": h, "why": "no material set in HelixScreen"})
+                    continue
+                if row["firmware"].get("official"):
+                    skipped.append({"head": h, "why": "record came from an RFID tag"})
+                    continue
+                got = helix.sync_lines(h - 1, row["helix"])
+                if isinstance(got, str):
+                    skipped.append({"head": h, "why": got})
+                else:
+                    lines += got
+            if not lines:
+                return {"ok": True, "nothing_to_do": True, "skipped": skipped,
+                        "heads": [{"head": r["head"], "filament": r["filament"]} for r in st["heads"]]}
+            script = "\n".join(lines)
+            if not confirm:
+                return gate.confirm_required("sync_firmware_filaments", {"gcode": script, "skipped": skipped})
+            await c.gcode_script(script)
+            after = await _filament_state(c)
+        return {"ok": True, "sent": script, "skipped": skipped, "stale_heads_now": after.get("stale_heads")}
+    except (PrinterNotReady, ApiError) as e:
         return _err(e)
 
 
@@ -947,6 +1054,8 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "list_print_history": ("List print history", True, False),
     "list_gcode_files": ("List G-code files on printer", True, False),
     "check_runout_backups": ("Check runout backup heads", True, False),
+    "get_loaded_filaments": ("Show each head's filament (HelixScreen + printer)", True, False),
+    "sync_firmware_filaments": ("Write HelixScreen's filaments to the printer's record", False, True),
     "get_head_offsets": ("Get per-head XYZ offsets", True, False),
     "calibrate_head_offsets": ("Run the head offset calibration", False, True),
     "get_console": ("Get recent console lines", True, False),
