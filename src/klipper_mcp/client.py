@@ -42,10 +42,10 @@ class MoonrakerClient:
                 return u
         return None
 
-    async def _request(self, method: str, path: str, *, params=None, files=None, data=None, timeout=None):
+    async def _request(self, method: str, path: str, *, params=None, files=None, data=None, json=None, timeout=None):
         kw = {} if timeout is None else {"timeout": timeout}
         try:
-            resp = await self._http.request(method, self._base + path, params=params, files=files, data=data, **kw)
+            resp = await self._http.request(method, self._base + path, params=params, files=files, data=data, json=json, **kw)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             # mDNS can fail while the wired IP still answers (or the reverse): try each configured
             # URL once per client, remember the one that answers, forget it if nothing does.
@@ -54,7 +54,7 @@ class MoonrakerClient:
                 _LEARNED.pop(self._cfg.base_url, None)
                 raise NotReachable(f"Moonraker not reachable at {self._base}: {e}") from e
             self._base = nxt
-            return await self._request(method, path, params=params, files=files, data=data, timeout=timeout)
+            return await self._request(method, path, params=params, files=files, data=data, json=json, timeout=timeout)
         except httpx.TransportError as e:
             # Connected and sent, but the reply never came (read timeout, dropped connection).
             # The printer may be running the request right now: never retry it, on this URL or
@@ -106,6 +106,19 @@ class MoonrakerClient:
             return None
         v = (r or {}).get("value") if isinstance(r, dict) else None
         return v if isinstance(v, dict) else None
+
+    async def database_put(self, namespace: str, key: str, value) -> None:
+        await self._request("POST", "/server/database/item", json={"namespace": namespace, "key": key, "value": value})
+
+    async def database_delete(self, namespace: str, key: str) -> None:
+        await self._request("DELETE", "/server/database/item", params={"namespace": namespace, "key": key})
+
+    async def database_backup(self, filename: str) -> dict | None:
+        """Moonraker's own database backup (newer Moonraker only); None if unsupported."""
+        try:
+            return await self._request("POST", "/server/database/backup", params={"filename": filename})
+        except ApiError:
+            return None
 
     async def history_list(self, limit: int = 20, since: float | None = None) -> list[dict]:
         params = {"limit": limit, "order": "desc"}

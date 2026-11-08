@@ -12,6 +12,7 @@ from . import outcomes
 from . import runout
 from . import offsets
 from . import helix
+from . import spools
 from .status import summarize_status, STATUS_OBJECTS
 
 try:
@@ -651,6 +652,194 @@ async def sync_firmware_filaments(heads: list[int] | None = None, confirm: bool 
         return _err(e)
 
 
+# --- spool inventory (tracker #69) -------------------------------------------------------
+
+async def _inventory(c, sync: bool = True) -> dict:
+    """The inventory, after logging any finished jobs not counted yet (once each, by job id)."""
+    sp = await c.database_namespace(spools.NS_SPOOLS) or {}
+    us = await c.database_namespace(spools.NS_USAGE) or {}
+    ld = await c.database_namespace(spools.NS_LOADS) or {}
+    logged = []
+    if sync and sp:
+        jobs = await c.history_list(limit=50)
+        rows = spools.new_usage_rows(jobs, us, ld)
+        for k, v in rows.items():
+            await c.database_put(spools.NS_USAGE, k, v)
+            us[k] = v
+            logged.append({k2: v.get(k2) for k2 in ("job_id", "head", "spool_id", "grams", "result")})
+    return {"spools": sp, "usage": us, "loads": ld, "logged_now": logged}
+
+
+@mcp.tool()
+async def list_spools(status: str | None = None, material: str | None = None, include_empty: bool = False) -> dict:
+    """The spool inventory (kept in Moonraker's database on the printer, shared with Snorca's
+    Spools tab): each spool's brand, material, colour, Snorca preset, grams left, grams used,
+    status and the head it's on, plus stock (grams on hand per material). Finished jobs not yet
+    counted are logged first (grams per head from the slicer, prorated for cancelled jobs; each
+    job once). status / material filter (case-insensitive); empty spools are left out unless
+    include_empty. Read-only apart from that usage logging."""
+    try:
+        async with _client() as c:
+            inv = await _inventory(c)
+        rows = spools.view(inv["spools"], inv["usage"], inv["loads"])
+        if not inv["spools"]:
+            return {"spools": [], "note": "the inventory is empty; import_spools(path) loads the old spreadsheet"}
+        stock = spools.stock(rows)
+        if not include_empty:
+            rows = [r for r in rows if str(r.get("status", "")).lower() != "empty"]
+        if status:
+            rows = [r for r in rows if str(r.get("status", "")).lower() == status.lower()]
+        if material:
+            rows = [r for r in rows if material.lower() in str(r.get("material", "")).lower()]
+        heads = {h: s for h, s in spools.heads_now(inv["loads"]).items()}
+        return {"spools": rows, "stock": stock, "on_heads": {str(h): heads.get(h) for h in range(1, spools.HEADS + 1)},
+                "logged_now": inv["logged_now"]}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def save_spool(spool_id: str, brand: str | None = None, material: str | None = None,
+                     colour: str | None = None, preset: str | None = None, start_g: float | None = None,
+                     status: str | None = None, notes: str | None = None, location: str | None = None) -> dict:
+    """Add a spool or change its fields (only the ones given). spool_id: e.g. "BLK-PLA-02"
+    (letters, digits, - and _). start_g: net filament grams when tracking starts (nominal 1000
+    for a new 1 kg spool); a new spool's tracking starts now. status: Active / Sealed / Empty.
+    location: where it is when not on a head (shelf, dryer...). Use weigh_spool for weigh-ins
+    and load_spool for heads."""
+    if not spools.valid_id(spool_id):
+        return {"error": "spool_id: 1-40 letters, digits, - or _"}
+    try:
+        async with _client() as c:
+            cur = (await c.database_namespace(spools.NS_SPOOLS) or {}).get(spool_id)
+            sp = dict(cur or {})
+            for k, v in {"brand": brand, "material": material, "colour": colour, "preset": preset,
+                         "start_g": start_g, "status": status, "notes": notes, "location": location}.items():
+                if v is not None:
+                    sp[k] = v
+            if cur is None:
+                sp.setdefault("tracked_from", spools.now_iso())
+                sp.setdefault("status", "Active")
+            await c.database_put(spools.NS_SPOOLS, spool_id, sp)
+        return {"ok": True, "created": cur is None, "spool": {"id": spool_id, **sp}}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def weigh_spool(spool_id: str, weight_g: float, empty_spool_g: float | None = None) -> dict:
+    """Record a weigh-in: the spool's grams left become weight_g minus empty_spool_g (the empty
+    reel; omit if weight_g is already net), and usage counts from now. Logged in the loads log."""
+    try:
+        async with _client() as c:
+            sp = (await c.database_namespace(spools.NS_SPOOLS) or {}).get(spool_id)
+            if sp is None:
+                return {"error": "unknown_spool", "spool_id": spool_id}
+            net = round(float(weight_g) - float(empty_spool_g or 0), 1)
+            if net < 0:
+                return {"error": "weight below the empty spool's weight"}
+            t = spools.now_iso()
+            sp.update({"start_g": net, "tracked_from": t, "weighed_g": net, "weighed_at": t})
+            await c.database_put(spools.NS_SPOOLS, spool_id, sp)
+            await c.database_put(spools.NS_LOADS, spools.load_key(t, None),
+                                 {"time": t, "head": None, "spool_id": spool_id, "action": "weighed",
+                                  "notes": f"{weight_g} g" + (f" - {empty_spool_g} g empty spool" if empty_spool_g else "")})
+        return {"ok": True, "spool_id": spool_id, "remaining_g": net}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def load_spool(head: int, spool_id: str | None = None, action: str = "loaded", notes: str | None = None) -> dict:
+    """Record what's on a head: action "loaded" (spool_id goes on head 1-4, replacing whatever was
+    there), "backup" (loaded as an auto-refill backup), "unloaded" or "ran out" (spool_id
+    optional: whatever is on the head comes off; "ran out" also marks that spool Empty). Usage
+    from later jobs goes to the spool on each head."""
+    if not 1 <= head <= spools.HEADS:
+        return {"error": f"head is 1-{spools.HEADS}"}
+    action = action.lower()
+    if action not in spools.ON_HEAD + ("unloaded", "ran out"):
+        return {"error": "action: loaded | backup | unloaded | ran out"}
+    try:
+        async with _client() as c:
+            sp_all = await c.database_namespace(spools.NS_SPOOLS) or {}
+            ld = await c.database_namespace(spools.NS_LOADS) or {}
+            on = spools.heads_now(ld)
+            t = spools.now_iso()
+            n = 0
+            if action in spools.ON_HEAD:
+                if spool_id not in sp_all:
+                    return {"error": "unknown_spool", "spool_id": spool_id}
+                prev = on.get(head)
+                if prev and prev != spool_id:
+                    await c.database_put(spools.NS_LOADS, spools.load_key(t, head, n),
+                                         {"time": t, "head": head, "spool_id": prev, "action": "unloaded",
+                                          "notes": f"replaced by {spool_id}"})
+                    n += 1
+            else:
+                spool_id = spool_id or on.get(head)
+                if action == "ran out" and spool_id in sp_all:
+                    sp = dict(sp_all[spool_id]); sp["status"] = "Empty"
+                    await c.database_put(spools.NS_SPOOLS, spool_id, sp)
+            await c.database_put(spools.NS_LOADS, spools.load_key(t, head, n),
+                                 {k: v for k, v in {"time": t, "head": head, "spool_id": spool_id, "action": action,
+                                                    "notes": notes}.items() if v is not None})
+            ld2 = await c.database_namespace(spools.NS_LOADS) or {}
+        return {"ok": True, "on_heads": {str(h): s for h, s in spools.heads_now(ld2).items()}}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def import_spools(path: str, confirm: bool = False) -> dict:
+    """One-time import of the old spool spreadsheet (U1 Spool Tracker.xlsx: Spools, Usage log,
+    Loads) into the printer's inventory. Refused if the inventory already has spools. TWO-PHASE:
+    without confirm=true it shows what would be imported."""
+    try:
+        data = spools.import_workbook(path)
+    except Exception as e:  # noqa: BLE001
+        return {"error": "cannot_read", "reason": str(e)}
+    try:
+        async with _client() as c:
+            if await c.database_namespace(spools.NS_SPOOLS):
+                return {"error": "inventory_not_empty", "reason": "the printer already has spools; nothing imported"}
+            summary = {"spools": len(data["spools"]), "usage_rows": len(data["usage"]), "load_rows": len(data["loads"]),
+                       "ids": sorted(data["spools"])}
+            if not confirm:
+                return gate.confirm_required("import_spools", summary)
+            for ns, rows in ((spools.NS_SPOOLS, data["spools"]), (spools.NS_USAGE, data["usage"]),
+                             (spools.NS_LOADS, data["loads"])):
+                for k, v in rows.items():
+                    await c.database_put(ns, k, v)
+        return {"ok": True, **summary}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def export_spools(path: str) -> dict:
+    """Write the inventory to a spreadsheet in the old U1 Spool Tracker layout, as the backup copy
+    (an existing file is first copied to <name>.bak-<time>.xlsx), and ask Moonraker to back up its
+    database too (newer Moonraker only), since a firmware reflash may wipe it."""
+    import shutil
+    try:
+        async with _client() as c:
+            inv = await _inventory(c)
+            stamp = spools.load_key(spools.now_iso(), None)[:15]
+            db = await c.database_backup(f"snorca-spools-{stamp}.db")
+        p = Path(path)
+        backup = None
+        if p.exists():
+            backup = p.with_name(f"{p.stem}.bak-{stamp}{p.suffix}")
+            shutil.copy2(p, backup)
+        spools.export_workbook(str(p), inv["spools"], inv["usage"], inv["loads"])
+        return {"ok": True, "written": str(p), "previous_copied_to": str(backup) if backup else None,
+                "moonraker_backup": db if db is not None else "not supported by this Moonraker",
+                "spools": len(inv["spools"]), "usage_rows": len(inv["usage"])}
+    except ApiError as e:
+        return _err(e)
+
+
 @mcp.tool()
 async def get_head_offsets() -> dict:
     """Snapmaker U1: each head's XYZ offset from head 1 (what the offset calibration measured and
@@ -1055,6 +1244,12 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "list_gcode_files": ("List G-code files on printer", True, False),
     "check_runout_backups": ("Check runout backup heads", True, False),
     "get_loaded_filaments": ("Show each head's filament (HelixScreen + printer)", True, False),
+    "list_spools": ("List spools and stock", False, False),
+    "save_spool": ("Add or edit a spool", False, False),
+    "weigh_spool": ("Record a spool weigh-in", False, False),
+    "load_spool": ("Record a spool loaded on or removed from a head", False, False),
+    "import_spools": ("Import the spool spreadsheet into the printer", False, True),
+    "export_spools": ("Back up the spool inventory to a spreadsheet", False, False),
     "sync_firmware_filaments": ("Write HelixScreen's filaments to the printer's record", False, True),
     "get_head_offsets": ("Get per-head XYZ offsets", True, False),
     "calibrate_head_offsets": ("Run the head offset calibration", False, True),

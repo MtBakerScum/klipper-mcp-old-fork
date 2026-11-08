@@ -10,6 +10,7 @@
 - `get_console` drops duplicate entries (same time, type and message) that Moonraker can store several times.
 - The capture systemd unit is sandboxed (ProtectSystem=strict, ProtectHome=read-only with the store directory writable, NoNewPrivileges, empty capability set, `@system-service` syscall filter).
 ### Added
+- Spool inventory (tracker #69) in Moonraker's database on the printer (`snorca_spools`, `snorca_spool_usage`, `snorca_spool_loads`), shared with Snorca's Spools tab: list_spools (grams left, stock per material, heads; logs finished jobs not counted yet, once each by job id, slicer grams prorated for cancelled jobs), save_spool, weigh_spool, load_spool, import_spools (one-time, from U1 Spool Tracker.xlsx, confirm-gated), export_spools (spreadsheet backup + Moonraker database backup). New dependency: openpyxl.
 - get_loaded_filaments (tracker #68): each U1 head's filament as set in HelixScreen (Moonraker `lane_data` database: brand, spool name, material, colour, Spoolman spool, grams, temps) beside the printer's own record (`print_task_config`) and the feeder sensor; `stale_heads` lists where they disagree.
 - sync_firmware_filaments(heads?, confirm): rewrites the printer's record from HelixScreen the way HelixScreen does (`SET_PRINT_FILAMENT_CONFIG`, vendor Snapmaker/Generic, sub-type or Basic, colour). Refused during a print; skips RFID-tag heads.
 - check_runout_backups / start_print preview name heads by their HelixScreen filament and warn when the printer's record (what refill matches on) disagrees.
