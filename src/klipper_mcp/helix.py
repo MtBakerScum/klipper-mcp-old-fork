@@ -145,6 +145,11 @@ def summarize(ptc: dict, helix_doc: dict | None, detected: dict[int, bool] | Non
         row = {"head": i + 1, "helix": rec, "filament": label(rec), "firmware": fw}
         if detected is not None:
             row["filament_detected"] = bool(detected.get(i))
+            if not detected.get(i):
+                # Empty head: Helix keeps the last spool's record after an unload, so it isn't stale.
+                diffs = []
+                if rec:
+                    row["note"] = "no filament in this head; HelixScreen's record is the last spool it had"
         if diffs:
             row["firmware_stale"] = diffs
             if fw["official"]:
