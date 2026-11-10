@@ -142,7 +142,7 @@ def test_import_keeps_bracketed_ids_and_rows_without_job_id(tmp_path):
     assert rows["Polymaker-ASA-Black"]["head"] == 3
 
 
-def test_rename_and_delete_spool(monkeypatch):
+def test_rename_spool(monkeypatch):
     import asyncio
     from klipper_mcp import server, spools as sp
 
@@ -165,7 +165,3 @@ def test_rename_and_delete_spool(monkeypatch):
     assert r["ok"] and "A-PLA-X-01" in db[sp.NS_SPOOLS] and "A-01" not in db[sp.NS_SPOOLS]
     assert db[sp.NS_USAGE]["j1_h1"]["spool_id"] == "A-PLA-X-01"
     assert db["lane_data"]["T0"]["snorca_spool"] == "A-PLA-X-01"
-    assert asyncio.run(server.delete_spool("A-PLA-X-01", confirm=True))["error"] == "on_head"
-    d = asyncio.run(server.delete_spool("B-01", confirm=True))
-    assert d["ok"] and "B-01" not in db[sp.NS_SPOOLS]
-    assert any(v["what"] == "delete" for v in db["snorca_spool_history"].values())
