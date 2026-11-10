@@ -773,6 +773,85 @@ async def weigh_spool(spool_id: str, weight_g: float, empty_spool_g: float | Non
         return _err(e)
 
 
+NS_SPOOL_HISTORY = "snorca_spool_history"  # the Spools tab's undo log (same records, so its Undo works)
+
+
+def _hist_key(t_iso: str, sid: str) -> str:
+    import re as _re
+    return _re.sub(r"[^0-9T]", "", t_iso) + "_" + sid
+
+
+@mcp.tool()
+async def rename_spool(spool_id: str, new_id: str, confirm: bool = False) -> dict:
+    """Rename a spool (change its ID). Its usage rows, load log and HelixScreen's note of which
+    spool is on a head follow it; the Spools tab's Undo can put it back. new_id: letters, digits,
+    - and _ (the tab's pattern: COLOUR-MATERIAL-BRAND-NN, e.g. BLK-PETGGF-ELG-01). TWO-PHASE:
+    without confirm=true this returns a preview (what moves) and changes nothing."""
+    if not spools.valid_id(new_id):
+        return {"error": "bad_id", "hint": "1-40 letters, digits, - or _"}
+    try:
+        async with _client() as c:
+            sp = await c.database_namespace(spools.NS_SPOOLS) or {}
+            if spool_id not in sp:
+                return {"error": "not_found", "spool_id": spool_id}
+            if new_id in sp:
+                return {"error": "exists", "new_id": new_id}
+            usage = await c.database_namespace(spools.NS_USAGE) or {}
+            loads = await c.database_namespace(spools.NS_LOADS) or {}
+            lanes = await c.database_namespace("lane_data") or {}
+            u_keys = [k for k, v in usage.items() if isinstance(v, dict) and v.get("spool_id") == spool_id]
+            l_keys = [k for k, v in loads.items() if isinstance(v, dict) and v.get("spool_id") == spool_id]
+            h_keys = [k for k, v in lanes.items() if isinstance(v, dict) and v.get("snorca_spool") == spool_id]
+            plan = {"from": spool_id, "to": new_id, "usage_rows": len(u_keys), "load_rows": len(l_keys),
+                    "helix_heads": h_keys}
+            if not confirm:
+                return {"preview": plan, "note": "nothing changed; call again with confirm=true"}
+            for k in u_keys:
+                await c.database_put(spools.NS_USAGE, k, {**usage[k], "spool_id": new_id})
+            for k in l_keys:
+                await c.database_put(spools.NS_LOADS, k, {**loads[k], "spool_id": new_id})
+            for k in h_keys:
+                await c.database_put("lane_data", k, {**lanes[k], "snorca_spool": new_id})
+            rec = sp[spool_id]
+            await c.database_put(spools.NS_SPOOLS, new_id, rec)
+            await c.database_delete(spools.NS_SPOOLS, spool_id)
+            t = spools.now_iso()
+            await c.database_put(NS_SPOOL_HISTORY, _hist_key(t, new_id),
+                                 {"time": t, "spool_id": new_id, "what": "rename", "from": spool_id, "before": rec})
+        return {"ok": True, **plan}
+    except ApiError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def delete_spool(spool_id: str, confirm: bool = False) -> dict:
+    """Delete a spool from the inventory (for ones entered by mistake or duplicates; use
+    save_spool(status="Empty") for a finished spool). Its usage history stays; the Spools tab's
+    Undo brings it back. Refused while it's on a head. TWO-PHASE: without confirm=true this returns
+    a preview and changes nothing. Only delete when Grant says to."""
+    try:
+        async with _client() as c:
+            sp = await c.database_namespace(spools.NS_SPOOLS) or {}
+            if spool_id not in sp:
+                return {"error": "not_found", "spool_id": spool_id}
+            loads = await c.database_namespace(spools.NS_LOADS) or {}
+            on = {s: h for h, s in spools.heads_now(loads).items()}
+            if spool_id in on:
+                return {"error": "on_head", "head": on[spool_id], "hint": "unload it first (load_spool action=unloaded)"}
+            usage = await c.database_namespace(spools.NS_USAGE) or {}
+            n_use = sum(1 for v in usage.values() if isinstance(v, dict) and v.get("spool_id") == spool_id)
+            plan = {"spool": {"id": spool_id, **sp[spool_id]}, "usage_rows_kept": n_use}
+            if not confirm:
+                return {"preview": plan, "note": "nothing changed; call again with confirm=true"}
+            t = spools.now_iso()
+            await c.database_put(NS_SPOOL_HISTORY, _hist_key(t, spool_id),
+                                 {"time": t, "spool_id": spool_id, "what": "delete", "before": sp[spool_id]})
+            await c.database_delete(spools.NS_SPOOLS, spool_id)
+        return {"ok": True, "deleted": spool_id, "usage_rows_kept": n_use}
+    except ApiError as e:
+        return _err(e)
+
+
 @mcp.tool()
 async def load_spool(head: int, spool_id: str | None = None, action: str = "loaded", notes: str | None = None) -> dict:
     """Record what's on a head: action "loaded" (spool_id goes on head 1-4, replacing whatever was
@@ -1273,6 +1352,8 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "list_spools": ("List spools and stock", False, False),
     "save_spool": ("Add or edit a spool", False, False),
     "weigh_spool": ("Record a spool weigh-in", False, False),
+    "rename_spool": ("Rename a spool", False, False),
+    "delete_spool": ("Delete a spool", False, True),
     "load_spool": ("Record a spool loaded on or removed from a head", False, False),
     "import_spools": ("Import the spool spreadsheet into the printer", False, True),
     "export_spools": ("Back up the spool inventory to a spreadsheet", False, False),

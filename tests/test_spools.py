@@ -140,3 +140,32 @@ def test_import_keeps_bracketed_ids_and_rows_without_job_id(tmp_path):
     assert rows["BLK-TPU-01"]["used_g"] == 69.8
     assert rows["Polymaker-ASA-Black"]["used_g"] == 5.0
     assert rows["Polymaker-ASA-Black"]["head"] == 3
+
+
+def test_rename_and_delete_spool(monkeypatch):
+    import asyncio
+    from klipper_mcp import server, spools as sp
+
+    db = {sp.NS_SPOOLS: {"A-01": {"brand": "X", "material": "PLA"}, "B-01": {"material": "PETG"}},
+          sp.NS_USAGE: {"j1_h1": {"spool_id": "A-01", "grams": 5}},
+          sp.NS_LOADS: {"20261101T000000_h1_0": {"time": "2026-11-01T00:00:00", "head": 1, "spool_id": "A-01", "action": "loaded"}},
+          "lane_data": {"T0": {"material": "PLA", "snorca_spool": "A-01"}}}
+
+    class C:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def database_namespace(self, ns): return db.get(ns)
+        async def database_put(self, ns, k, v): db.setdefault(ns, {})[k] = v
+        async def database_delete(self, ns, k): db.get(ns, {}).pop(k, None)
+
+    monkeypatch.setattr(server, "_client", lambda: C())
+    pv = asyncio.run(server.rename_spool("A-01", "A-PLA-X-01"))
+    assert pv["preview"]["usage_rows"] == 1 and "A-01" in db[sp.NS_SPOOLS]
+    r = asyncio.run(server.rename_spool("A-01", "A-PLA-X-01", confirm=True))
+    assert r["ok"] and "A-PLA-X-01" in db[sp.NS_SPOOLS] and "A-01" not in db[sp.NS_SPOOLS]
+    assert db[sp.NS_USAGE]["j1_h1"]["spool_id"] == "A-PLA-X-01"
+    assert db["lane_data"]["T0"]["snorca_spool"] == "A-PLA-X-01"
+    assert asyncio.run(server.delete_spool("A-PLA-X-01", confirm=True))["error"] == "on_head"
+    d = asyncio.run(server.delete_spool("B-01", confirm=True))
+    assert d["ok"] and "B-01" not in db[sp.NS_SPOOLS]
+    assert any(v["what"] == "delete" for v in db["snorca_spool_history"].values())
